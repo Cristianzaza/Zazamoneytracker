@@ -169,6 +169,12 @@ const CAT_DEFAULT = ["Alimentari","Ristoranti e bar","Viaggi","Trasporti","Auto 
   "Stipendio","Rimborsi","Altre entrate"];
 const NON_SPESE = ["Investimenti","Giroconti"];
 const ENTRATE_CAT = ["Stipendio","Rimborsi","Altre entrate"];
+const PRIO_DEFAULT = { "Alimentari":1,"Casa":1,"Utenze":1,"Telefono e internet":1,"Salute":1,"Trasporti":1,"Auto e carburante":1,"Assicurazioni":1,"Tasse":1,"Istruzione":1,
+  "Cura personale":2,"Sport":2,"Abbigliamento":2,"Abbonamenti":2,"Prelievi":2,"Carta di credito":2,"Altre spese":2,"Regali":2,
+  "Ristoranti e bar":3,"Viaggi":3,"Svago e cultura":3,"Shopping online":3 };
+const PRIO_LABEL = { 1: "Essenziale", 2: "Utile", 3: "Superflua" };
+const PRIO_COL = { 1: "#2E7D5B", 2: "#BC7A1C", 3: "#AF463C" };
+const prio = (c) => (S.cfg.catInfo?.[c]?.prio) || PRIO_DEFAULT[c] || 2;
 // traduzione delle categorie della banca (Moneymap) nelle nostre
 const BANCA = {
   "Alimentari":"Alimentari","Hotel Ristoranti e Viaggi":"Ristoranti e bar","Trasporti":"Trasporti","E-Commerce":"Shopping online",
@@ -214,6 +220,7 @@ const CFG_DEFAULT = () => ({
   categorie: [...CAT_DEFAULT], esclusi: [...NON_SPESE], budget: {}, regole: [],
   memoria: { esatti: {}, token: {} },
   stipendio: { importo: 0, giorno: 27 },
+  catInfo: {}, rimappa: {},
   saldo: null, saldoData: null, ultimoImport: null,
 });
 
@@ -281,6 +288,7 @@ async function caricaTutto() {
   const [cfg, scad, ob, ids] = await Promise.all([store.get("config", "main"), store.get("scadenze", "main"), store.get("obiettivi", "main"), store.listMesi()]);
   S.cfg = { ...CFG_DEFAULT(), ...(cfg || {}) };
   S.cfg.memoria = { esatti: {}, token: {}, ...(S.cfg.memoria || {}) };
+  S.cfg.catInfo = S.cfg.catInfo || {}; S.cfg.rimappa = S.cfg.rimappa || {};
   S.scad = scad || { items: [] };
   S.ob = ob || { items: [] };
   S.mesi = {};
@@ -365,6 +373,15 @@ function parseWorkbook(buf) {
   return { movimenti: out, saldo };
 }
 
+// nome leggibile per bonifici e addebiti SDD (solo a schermo: gli id dei movimenti non cambiano)
+function nome(t) {
+  let x = t.esercente || "";
+  const ben = x.match(/Beneficiario:\s*(.+?)\s+IBAN/i), cau = x.match(/Causale:\s*(.+?)(\s+TRN:|$)/i), ord = x.match(/Ordinante:\s*(.+?)\s+IBAN/i);
+  if (ben || ord) x = (ben || ord)[1] + (cau ? " · " + cau[1] : "");
+  x = x.replace(/\s+Adde\s?bito SDD.*$/i, "").replace(/\s+(Data Inserimento|Canale|TRN)\s*:.*$/i, "").replace(/\s{2,}/g, " ").trim();
+  return x || t.esercente;
+}
+
 /* ---------- categorizzazione che impara ---------- */
 const chiave = (t) => norm(t.esercente).slice(0, 40);
 const tokens = (t) => [...new Set(String(t.esercente).toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
@@ -382,7 +399,7 @@ function suggerisci(t) {
   const somma = ord.reduce((s, x) => s + x[1], 0);
   return ord.slice(0, 3).map(([cat, p]) => ({ cat, conf: p / somma, usati }));
 }
-function categoria(t) {
+function categoriaGrezza(t) {
   if (t.cat) return t.cat;
   const M = S.cfg.memoria, k = chiave(t);
   if (M.esatti[k]) return M.esatti[k];
@@ -395,6 +412,7 @@ function categoria(t) {
   if (t.catBanca) return t.catBanca;
   return t.importo > 0 ? "Altre entrate" : "Da categorizzare";
 }
+const categoria = (t) => { const c = categoriaGrezza(t); return S.cfg.rimappa[c] || c; };
 const daConfermare = (t) => !t.cat && !S.cfg.memoria.esatti[chiave(t)] && (categoria(t) === "Da categorizzare" || !t.catBanca);
 
 function impara(t, cat) {
@@ -456,7 +474,7 @@ function rinnova(s) {
   s.rinnovata = true;
   const next = addMesi(s.data, s.ricorrenza === "annuale" ? 12 : s.ricorrenza === "bimestrale" ? 2 : s.ricorrenza === "trimestrale" ? 3 : 1);
   if (!S.scad.items.some((x) => x.serie === (s.serie || s.id) && x.data === next))
-    S.scad.items.push({ id: uid(), serie: s.serie || s.id, nome: s.nome, importo: s.importo, data: next, cat: s.cat, ricorrenza: s.ricorrenza, pagata: false });
+    S.scad.items.push({ id: uid(), serie: s.serie || s.id, nome: s.nome, chiave: s.chiave, importo: s.importo, data: next, cat: s.cat, ricorrenza: s.ricorrenza, pagata: false });
 }
 
 /* ---------- derivati ---------- */
@@ -467,10 +485,11 @@ const escl = () => new Set(S.cfg.esclusi);
 const isSpesa = (t) => t.importo < 0 && !escl().has(categoria(t));
 const isEntrata = (t) => t.importo > 0 && !escl().has(categoria(t));
 
-function riepilogo(ym) {
+function riepilogo(ym, giornoMax = 31) {
   const r = { entrate: 0, uscite: 0, investito: 0, n: 0, perCat: {} };
   for (const t of (S.mesi[ym]?.tx || [])) {
     if (t.inSospeso && !S.mostraSospesi) continue;
+    if (+t.data.slice(8) > giornoMax) continue;
     const c = categoria(t); r.n++;
     if (escl().has(c)) { if (t.importo < 0) r.investito += -t.importo; }
     else if (t.importo > 0) r.entrate += t.importo;
@@ -481,12 +500,119 @@ function riepilogo(ym) {
 function mediaMensile() {
   const chiusi = mesiDisponibili().filter((ym) => ym < ymOggi()).slice(0, 6);
   if (!chiusi.length) return { risparmio: 0, uscite: 0, perCat: {}, n: 0 };
-  const acc = { risparmio: 0, uscite: 0, perCat: {}, n: chiusi.length };
-  for (const ym of chiusi) { const r = riepilogo(ym); acc.risparmio += r.entrate - r.uscite; acc.uscite += r.uscite; for (const [c, v] of Object.entries(r.perCat)) acc.perCat[c] = (acc.perCat[c] || 0) + v; }
-  acc.risparmio /= acc.n; acc.uscite /= acc.n; for (const c in acc.perCat) acc.perCat[c] /= acc.n;
+  const acc = { risparmio: 0, uscite: 0, entrate: 0, perCat: {}, n: chiusi.length };
+  for (const ym of chiusi) { const r = riepilogo(ym); acc.risparmio += r.entrate - r.uscite; acc.uscite += r.uscite; acc.entrate += r.entrate; for (const [c, v] of Object.entries(r.perCat)) acc.perCat[c] = (acc.perCat[c] || 0) + v; }
+  acc.risparmio /= acc.n; acc.uscite /= acc.n; acc.entrate /= acc.n; for (const c in acc.perCat) acc.perCat[c] /= acc.n;
   return acc;
 }
-const tutteCategorie = () => [...new Set([...S.cfg.categorie, ...tutti().map(categoria)])].filter((c) => c !== "Da categorizzare").sort((a, b) => a.localeCompare(b));
+const tutteCategorie = () => [...new Set([...S.cfg.categorie, ...Object.keys(S.cfg.catInfo), ...tutti().map(categoria)])].filter((c) => c !== "Da categorizzare").sort((a, b) => a.localeCompare(b));
+
+/* ---------- ricorrenti rilevati automaticamente ---------- */
+function ricorrenti() {
+  const gruppi = {};
+  for (const t of tutti()) { if (t.importo >= 0 || t.inSospeso) continue; if (escl().has(categoria(t))) continue; (gruppi[chiave(t)] ||= []).push(t); }
+  const out = [];
+  for (const [k, arr] of Object.entries(gruppi)) {
+    if (arr.length < 3) continue;
+    arr.sort((a, b) => a.data.localeCompare(b.data));
+    const imp = arr.map((t) => -t.importo).sort((a, b) => a - b), med = imp[Math.floor(imp.length / 2)];
+    if (med < 2) continue;
+    const simili = arr.filter((t) => Math.abs(-t.importo - med) <= Math.max(1, med * 0.15));
+    if (simili.length < 3) continue;
+    const gaps = []; for (let i = 1; i < simili.length; i++) gaps.push(diffGiorni(simili[i - 1].data, simili[i].data));
+    const g = gaps.sort((a, b) => a - b)[Math.floor(gaps.length / 2)];
+    const per = g >= 26 && g <= 35 ? "mensile" : g >= 6 && g <= 8 ? "settimanale" : g >= 85 && g <= 95 ? "trimestrale" : null;
+    if (!per) continue;
+    const ult = simili[simili.length - 1];
+    if ((per === "settimanale" && simili.length < 4) || diffGiorni(ult.data, oggi()) > (per === "settimanale" ? 21 : per === "mensile" ? 45 : 110)) continue;
+    out.push({ chiave: k, nome: nome(ult), importo: med, per, n: simili.length, ultima: ult.data, cat: categoria(ult),
+      mensile: per === "mensile" ? med : per === "settimanale" ? med * 4.33 : med / 3,
+      prossima: per === "mensile" ? addMesi(ult.data, 1) : per === "trimestrale" ? addMesi(ult.data, 3) : null,
+      giaScadenza: S.scad.items.some((x) => x.ricorrenza && (x.chiave === k || chiave({ esercente: x.nome }) === k)) });
+  }
+  return out.sort((a, b) => b.mensile - a.mensile);
+}
+// spesa media al giorno nelle categorie non essenziali, sui mesi chiusi
+function spesaVariabileGiornaliera() {
+  const chiusi = mesiDisponibili().filter((ym) => ym < ymOggi()).slice(0, 3);
+  if (!chiusi.length) return 0;
+  let tot = 0, gg = 0;
+  for (const ym of chiusi) { const r = riepilogo(ym); for (const [c, v] of Object.entries(r.perCat)) if (prio(c) > 1) tot += v; gg += giorniNelMese(ym); }
+  return tot / gg;
+}
+
+/* ---------- insight ---------- */
+const TONO = { ok: "var(--in)", warn: "var(--out)", info: "var(--accent)" };
+function insights(ym) {
+  const out = [], r = riepilogo(ym), corrente = ym === ymOggi(), media = mediaMensile();
+  const gTot = giorniNelMese(ym), gReale = corrente ? +oggi().slice(8) : gTot, gRes = gTot - gReale;
+  const gOggi = corrente && S.cfg.saldoData?.startsWith(ym) ? Math.min(gReale, +S.cfg.saldoData.slice(8)) : gReale;
+  const push = (peso, tono, titolo, testo) => out.push({ peso, tono, titolo, testo });
+  const tx = (S.mesi[ym]?.tx || []).filter((t) => !t.inSospeso);
+
+  const late = S.scad.items.filter((x) => !x.pagata && x.data < oggi());
+  if (late.length && corrente) push(95, "warn", `${late.length} scadenz${late.length === 1 ? "a" : "e"} in ritardo`, late.slice(0, 3).map((x) => `${x.nome} ${eur0(x.importo)}`).join(", ") + ".");
+
+  if (corrente && gOggi >= 3 && r.uscite > 0 && media.uscite) {
+    const proj = r.uscite / gOggi * gTot, d = proj - media.uscite;
+    if (Math.abs(d) > Math.max(50, media.uscite * 0.08))
+      push(90, d > 0 ? "warn" : "ok", `A questo ritmo chiudi il mese a ${eur0(proj)} di uscite`,
+        d > 0 ? `${eur0(d)} sopra la tua media di ${eur0(media.uscite)}. Per restare in media puoi spendere al massimo ${eur0(Math.max(0, media.uscite - r.uscite) / Math.max(1, gRes + 1))} al giorno fino a fine mese.`
+              : `${eur0(-d)} sotto la tua media di ${eur0(media.uscite)}.`);
+  }
+  for (const [c, b] of Object.entries(S.cfg.budget)) {
+    const v = r.perCat[c] || 0; if (!corrente || !v) continue;
+    if (v > b) push(85, "warn", `Budget ${c} sforato`, `${eur0(v - b)} oltre il tetto di ${eur0(b)}.`);
+    else if (gOggi >= 5 && v / gOggi * gTot > b * 1.1) push(75, "warn", `Budget ${c} a rischio`, `Restano ${eur0(b - v)} per ${gRes} giorni: ${eur0((b - v) / Math.max(1, gRes + 1))} al giorno, contro i ${eur0(v / gOggi)} al giorno che stai spendendo.`);
+  }
+  for (const [c, v] of Object.entries(r.perCat)) {
+    const m = media.perCat[c]; if (!m) continue; const att = corrente ? m * gOggi / gTot : m;
+    if (v > att * 1.5 && v - att > 60) push(80, "warn", `${c}: ${eur0(v)}, più del solito`, `${eur0(v - att)} oltre il normale per questo punto del mese (di solito ${eur0(m)} in un mese intero).`);
+  }
+  const sup = Object.entries(r.perCat).filter(([c]) => prio(c) === 3).reduce((a, [, v]) => a + v, 0);
+  if (sup > 0 && r.uscite) push(70, sup / r.uscite > 0.35 ? "warn" : "info", `${eur0(sup)} in spese superflue`, `${Math.round(sup / r.uscite * 100)}% delle uscite.${sup / r.uscite > 0.3 ? ` Tagliandone la metà risparmieresti ${eur0(sup / 2)}: è la leva più grande che hai.` : ""}`);
+  const prev = mesiDisponibili().find((m) => m < ym);
+  if (prev) { const rp = riepilogo(prev, corrente ? gOggi : 31), d = r.uscite - rp.uscite;
+    if (Math.abs(d) > 30) push(60, d > 0 ? "info" : "ok", `${eur0(Math.abs(d))} ${d > 0 ? "in più" : "in meno"} rispetto a ${meseLabel(prev)}`, corrente ? `Confronto allo stesso giorno del mese scorso (${eur0(rp.uscite)} allora).` : `Uscite totali a confronto (${eur0(rp.uscite)} allora).`); }
+  const ric = ricorrenti(), totRic = ric.reduce((a, x) => a + x.mensile, 0);
+  if (ric.length) push(50, "info", `${eur0(totRic)} al mese in spese ricorrenti`, `${ric.length} voci riconosciute: ${ric.slice(0, 3).map((x) => x.nome).join(", ")}${ric.length > 3 ? "…" : ""}. Ogni tanto chiediti quali usi davvero.`);
+  const perEs = {}; for (const t of tx) if (isSpesa(t)) perEs[nome(t)] = (perEs[nome(t)] || 0) + -t.importo;
+  const top = Object.entries(perEs).sort((a, b) => b[1] - a[1])[0];
+  if (top && r.uscite && top[1] / r.uscite > 0.12) push(40, "info", `${top[0]} è la voce più grande del mese`, `${eur0(top[1])}, il ${Math.round(top[1] / r.uscite * 100)}% delle uscite.`);
+  const ess = Object.entries(r.perCat).filter(([c]) => prio(c) === 1).reduce((a, [, v]) => a + v, 0);
+  const baseEntrate = corrente ? Math.max(r.entrate, S.cfg.stipendio?.importo || 0, media.entrate || 0) : r.entrate;
+  if (baseEntrate > 300 && ess && !corrente) push(30, "info", `Spese essenziali al ${Math.round(ess / baseEntrate * 100)}% delle entrate`, ess / baseEntrate > 0.5 ? `Sopra il 50%: il margine si recupera solo rivedendo le voci fisse.` : `Sotto il 50%: il risparmio lo decidono le voci utili e superflue.`);
+  if (corrente && gOggi >= 7) { const attivi = new Set(tx.filter(isSpesa).map((t) => t.data)).size;
+    push(20, "ok", `${gOggi - attivi} giorni senza spese su ${gOggi}`, `Nei giorni in cui spendi, la media è ${eur0(r.uscite / Math.max(1, attivi))}.`); }
+  if (!corrente && r.entrate) { const t = (r.entrate - r.uscite) / r.entrate;
+    push(65, t >= 0.2 ? "ok" : t >= 0 ? "info" : "warn", `Tasso di risparmio ${Math.round(t * 100)}%`, t >= 0.2 ? "Sopra il 20%, la soglia che le app di budgeting considerano sana." : t >= 0 ? "Positivo ma sotto il 20%: c'è margine." : "Il mese è chiuso in negativo."); }
+  return out.sort((a, b) => b.peso - a.peso).slice(0, 7);
+}
+function bloccoInsight(ym) {
+  const ins = insights(ym); if (!ins.length) return "";
+  return `<div class="card tight"><div style="padding:14px 14px 4px"><h2>Cosa noto <small>${meseLabel(ym)}</small></h2></div>
+    <div class="list">${ins.map((i) => `<div class="item" style="cursor:default;align-items:flex-start"><i class="dot" style="margin-top:7px;background:${TONO[i.tono]}"></i>
+      <div style="min-width:0;flex:1"><div class="t" style="white-space:normal;font-weight:600">${esc(i.titolo)}</div><div class="sub" style="line-height:1.45">${esc(i.testo)}</div></div></div>`).join("")}</div></div>`;
+}
+
+/* ---------- gestione categorie ---------- */
+function rinominaCat(a, b) {
+  if (!b || a === b) return;
+  S.cfg.categorie = [...new Set(S.cfg.categorie.map((c) => (c === a ? b : c)).concat([b]))];
+  S.cfg.catInfo[b] = S.cfg.catInfo[a] || { prio: prio(a) }; delete S.cfg.catInfo[a];
+  if (S.cfg.budget[a] !== undefined) { S.cfg.budget[b] = S.cfg.budget[a]; delete S.cfg.budget[a]; }
+  S.cfg.regole.forEach((r) => { if (r.cat === a) r.cat = b; });
+  S.cfg.esclusi = [...new Set(S.cfg.esclusi.map((c) => (c === a ? b : c)))];
+  for (const k in S.cfg.memoria.esatti) if (S.cfg.memoria.esatti[k] === a) S.cfg.memoria.esatti[k] = b;
+  for (const w in S.cfg.memoria.token) { const o = S.cfg.memoria.token[w]; if (o[a]) { o[b] = (o[b] || 0) + o[a]; delete o[a]; } }
+  for (const k in S.cfg.rimappa) if (S.cfg.rimappa[k] === a) S.cfg.rimappa[k] = b;
+  S.cfg.rimappa[a] = b;
+  const toccati = new Set();
+  for (const ym in S.mesi) for (const t of S.mesi[ym].tx) if (t.cat === a) { t.cat = b; toccati.add(ym); }
+  S.scad.items.forEach((x) => { if (x.cat === a) x.cat = b; });
+  return [...toccati];
+}
+function contaCat() { const c = {}; for (const t of tutti()) { const k = categoria(t); c[k] = (c[k] || 0) + 1; } return c; }
 
 /* ---------- icone ---------- */
 const I = {
@@ -596,7 +722,10 @@ function vistaOggi() {
   const saldoBase = S.cfg.saldo ?? 0;
   const libero = saldoBase - totArrivo + stipAtteso;
   const liberoDopoBudget = libero - budgetResiduo;
-  const ritmoAtteso = media.uscite ? media.uscite * (giornoOggi / giorniTot) : 0;
+  const gDati = corrente && S.cfg.saldoData?.startsWith(ym) ? Math.min(giornoOggi, +S.cfg.saldoData.slice(8)) : giornoOggi;
+  const ritmoAtteso = media.uscite ? media.uscite * (gDati / giorniTot) : 0;
+  const varG = spesaVariabileGiornaliera(), prevResiduo = varG * giorniResidui;
+  const prev = mesiDisponibili().find((m) => m < ym), rPrev = prev ? riepilogo(prev) : null;
 
   return `
     ${daCat.length ? `<div class="card" style="border-color:#E8D3AE;background:#FDFAF2">
@@ -608,8 +737,9 @@ function vistaOggi() {
       <div class="kpi big" style="flex:2 1 220px">
         <div class="l">Libero fino a fine mese</div>
         <div class="v num ${libero < 0 ? "out" : ""}">${eur(libero)}</div>
-        <div class="n num">saldo ${eur0(saldoBase)} − scadenze ${eur0(totArrivo)}${stipAtteso ? ` + stipendio atteso ${eur0(stipAtteso)}` : ""}</div>
+        <div class="n num">saldo ${eur0(saldoBase)} − scadenze ${eur0(totArrivo)}${stipAtteso ? ` + stipendio atteso ${eur0(stipAtteso)}` : ""}${gDati < giornoOggi ? ` · movimenti aggiornati al ${ddmm(S.cfg.saldoData)}` : ""}</div>
         ${budgetResiduo ? `<div class="n num">${eur0(liberoDopoBudget)} tolto quanto resta nei budget</div>` : ""}
+        ${varG ? `<div class="n num">Previsione a fine mese: <strong class="${libero - prevResiduo < 0 ? "out" : "in"}">${eur0(libero - prevResiduo)}</strong>, se spendi come al solito (${eur0(varG)}/giorno nelle voci non essenziali)</div>` : ""}
       </div>
       <div class="kpi">
         <div class="l">${giorniResidui} giorni alla fine del mese</div>
@@ -617,6 +747,8 @@ function vistaOggi() {
         <div class="n">ritmo per arrivare a zero</div>
       </div>
     </div>` : ""}
+
+    ${bloccoInsight(ym)}
 
     <div class="kpis">
       <div class="kpi"><div class="l">Entrate</div><div class="v num in">${eur0(r.entrate)}</div></div>
@@ -633,13 +765,22 @@ function vistaOggi() {
 
     <div class="card"><h2>Spese per categoria <small>${meseLabel(ym)}</small></h2>
       ${Object.keys(r.perCat).length ? Object.entries(r.perCat).sort((a, b) => b[1] - a[1]).map(([c, v]) => {
-        const b = S.cfg.budget[c], m = media.perCat[c];
-        return `<div class="catrow"><div class="row"><span style="color:var(--slate)">${esc(c)}</span>
-          <span class="num ${b && v > b ? "out" : ""}"><strong>${eur(v)}</strong>${b ? ` / ${eur0(b)}` : m ? ` <span class="sub">media ${eur0(m)}</span>` : ""}</span></div>
+        const b = S.cfg.budget[c], m = media.perCat[c], pv = rPrev ? rPrev.perCat[c] || 0 : null, d = pv !== null ? v - pv : null;
+        return `<div class="catrow"><div class="row"><span style="color:var(--slate);display:flex;align-items:center;gap:6px;min-width:0"><i class="dot" style="background:${PRIO_COL[prio(c)]}" title="${PRIO_LABEL[prio(c)]}"></i><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(c)}</span></span>
+          <span class="num ${b && v > b ? "out" : ""}" style="white-space:nowrap"><strong>${eur(v)}</strong>${b ? ` / ${eur0(b)}` : ""}${d !== null && Math.abs(d) >= 5 ? ` <span class="sub ${d > 0 ? "out" : "in"}">${d > 0 ? "▲" : "▼"} ${eur0(Math.abs(d))}</span>` : m && !b ? ` <span class="sub">media ${eur0(m)}</span>` : ""}</span></div>
           <div class="bar"><i style="width:${Math.min(100, v / (b || r.uscite || 1) * 100)}%;background:${b && v > b ? "var(--out)" : colore(c)}"></i></div></div>`;
-      }).join("") : `<div class="sub">Nessuna spesa in questo mese.</div>`}
-    </div>`;
+      }).join("") + `<div class="sub" style="margin-top:6px;display:flex;gap:12px;flex-wrap:wrap">${[1, 2, 3].map((p) => `<span><i class="dot" style="background:${PRIO_COL[p]}"></i> ${PRIO_LABEL[p]}</span>`).join("")}${rPrev ? `<span>▲▼ rispetto a ${meseLabel(prev)}</span>` : ""}</div>` : `<div class="sub">Nessuna spesa in questo mese.</div>`}
+    </div>
+
+    ${(() => { const e = {}; for (const t of movMeseAttivi(ym)) if (isSpesa(t)) e[nome(t)] = (e[nome(t)] || 0) + -t.importo;
+      const top = Object.entries(e).sort((a, b) => b[1] - a[1]).slice(0, 6); if (!top.length) return "";
+      return `<div class="card"><h2>Dove spendi di più <small>esercenti</small></h2>${top.map(([n, v]) => `<div class="row" style="padding:7px 0;border-top:1px solid var(--soft)"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(n)}</span><span class="num" style="white-space:nowrap"><strong>${eur(v)}</strong> <span class="sub">${Math.round(v / (r.uscite || 1) * 100)}%</span></span></div>`).join("")}</div>`; })()}
+
+    ${(() => { const anno = ym.slice(0, 4), mm = mesiDisponibili().filter((m) => m.startsWith(anno)); if (mm.length < 2) return "";
+      let e = 0, u = 0, best = null; for (const m of mm) { const x = riepilogo(m); e += x.entrate; u += x.uscite; const n = x.entrate - x.uscite; if (!best || n > best.n) best = { m, n }; }
+      return `<div class="card"><h2>Anno ${anno} <small>${mm.length} mesi</small></h2><div class="kpis" style="margin:0"><div class="kpi"><div class="l">Entrate</div><div class="v num in">${eur0(e)}</div></div><div class="kpi"><div class="l">Uscite</div><div class="v num out">${eur0(u)}</div><div class="n num">${eur0(u / mm.length)} al mese</div></div><div class="kpi"><div class="l">Risparmio</div><div class="v num ${e - u >= 0 ? "in" : "out"}">${eur0(e - u)}</div><div class="n">${e ? Math.round((e - u) / e * 100) + "% · mese migliore " + MESI[+best.m.slice(5) - 1] : ""}</div></div></div></div>`; })()}`;
 }
+function movMeseAttivi(ym) { return (S.mesi[ym]?.tx || []).filter((t) => S.mostraSospesi || !t.inSospeso); }
 function grafico() {
   const mesi = mesiDisponibili().slice(0, 12).reverse();
   const dati = mesi.map((ym) => ({ ym, ...riepilogo(ym) }));
@@ -654,7 +795,7 @@ function vistaMovimenti() {
   const coda = tutti().filter(daConfermare).sort((a, b) => b.data.localeCompare(a.data));
   const fm = S.filtroMese ?? S.mese, q = S.q.toLowerCase();
   const lista = attivi().filter((t) => fm === "tutti" || ymOf(t.data) === fm)
-    .filter((t) => !q || t.esercente.toLowerCase().includes(q) || categoria(t).toLowerCase().includes(q))
+    .filter((t) => !q || nome(t).toLowerCase().includes(q) || t.esercente.toLowerCase().includes(q) || categoria(t).toLowerCase().includes(q) || Math.abs(t.importo).toFixed(2).replace(".", ",").includes(q) || Math.abs(t.importo).toFixed(2).includes(q))
     .sort((a, b) => b.data.localeCompare(a.data));
   const tot = lista.reduce((s, t) => s + t.importo, 0);
   const cats = tutteCategorie();
@@ -665,7 +806,7 @@ function vistaMovimenti() {
         const sg = suggerisci(t), best = sg[0];
         const opzioni = [...new Set([...sg.map((s) => s.cat), ...(t.catBanca && BANCA[t.catBanca] ? [BANCA[t.catBanca]] : []), ...frequenti(4)])].slice(0, 5);
         return `<div class="item" style="flex-direction:column;align-items:stretch">
-          <div class="row"><div style="min-width:0"><div class="t">${esc(t.esercente)}</div><div class="s"><span>${ddmm(t.data)} · ${esc(t.tipo)}</span></div></div>
+          <div class="row"><div style="min-width:0"><div class="t">${esc(nome(t))}</div><div class="s"><span>${ddmm(t.data)} · ${esc(t.tipo)}</span></div></div>
             <div class="a num ${t.importo > 0 ? "in" : ""}">${eur(t.importo)}</div></div>
           <div class="sugg">${opzioni.map((c) => `<button class="chip ${best && c === best.cat && best.conf >= 0.5 ? "best" : ""}" data-act="cat" data-id="${esc(t.id)}" data-cat="${esc(c)}">${esc(c)}</button>`).join("")}
             <select class="chip" data-act="catSel" data-id="${esc(t.id)}"><option value="">altra…</option>${cats.map((c) => `<option>${esc(c)}</option>`).join("")}</select></div>
@@ -684,7 +825,7 @@ function vistaMovimenti() {
     <div class="card tight"><div class="list">${lista.slice(0, 300).map((t) => {
       const c = categoria(t);
       return `<div class="item" data-act="apri" data-id="${esc(t.id)}"><div style="min-width:0;flex:1">
-        <div class="t">${esc(t.esercente)}${t.inSospeso ? `<span class="tag wait">in attesa</span>` : ""}${t.nuovo ? `<span class="tag new">nuovo</span>` : ""}</div>
+        <div class="t">${esc(nome(t))}${t.inSospeso ? `<span class="tag wait">in attesa</span>` : ""}${t.nuovo ? `<span class="tag new">nuovo</span>` : ""}</div>
         <div class="s"><span>${ddmm(t.data)}</span><i class="dot" style="background:${colore(c)}"></i><span>${esc(c)}</span></div></div>
         <div class="a num ${t.importo > 0 ? "in" : ""}">${eur(t.importo)}</div></div>
         ${S.aperto === t.id ? `<div class="edit"><div class="meta">${esc(t.tipo)}${t.catBanca ? ` · banca: ${esc(t.catBanca)}` : ""}</div>
@@ -728,6 +869,11 @@ function vistaScadenze() {
       </div></div>
     <div class="card tight"><div style="padding:14px 14px 4px"><h2>Da pagare <small>${eur(aperte.reduce((s, x) => s + x.importo, 0))}</small></h2></div>
       <div class="list">${aperte.map(rigaScadenza).join("") || `<div class="center">Nessuna scadenza aperta.</div>`}</div></div>
+    ${(() => { const ric = ricorrenti().filter((x) => !x.giaScadenza); if (!ric.length) return "";
+      return `<div class="card tight"><div style="padding:14px 14px 4px"><h2>Ricorrenti riconosciute <small>${eur0(ric.reduce((a, x) => a + x.mensile, 0))}/mese</small></h2>
+        <p class="help" style="margin:0 0 6px">Spese che tornano con importo e cadenza regolari. Trasformale in scadenze per vederle nel calcolo di fine mese.</p></div>
+        <div class="list">${ric.map((x) => `<div class="item" style="cursor:default"><div style="min-width:0;flex:1"><div class="t">${esc(x.nome)}</div><div class="s"><span>${x.per} · ${x.n} volte · ultima ${ddmm(x.ultima)}${x.prossima ? ` · prossima ${ddmm(x.prossima)}` : ""}</span></div></div>
+          <div style="display:flex;align-items:center;gap:8px"><span class="a num">${eur(x.importo)}</span>${x.prossima ? `<button class="btn sm" data-act="ricScad" data-k="${esc(x.chiave)}">Scadenza</button>` : ""}</div></div>`).join("")}</div></div>`; })()}
     ${chiuse.length ? `<div class="card tight"><div style="padding:14px 14px 4px"><h2>Pagate di recente</h2></div><div class="list">${chiuse.map(rigaScadenza).join("")}</div></div>` : ""}`;
 }
 
@@ -789,9 +935,14 @@ function vistaAltro() {
       <div class="grid c2"><input class="field num" id="stipImporto" inputmode="decimal" placeholder="Importo netto €" value="${stip.importo || ""}"><input class="field num" id="stipGiorno" type="number" min="1" max="31" placeholder="Giorno del mese" value="${stip.giorno || ""}"></div>
       <div class="btns" style="margin-top:9px"><button class="btn" data-act="stipSalva">Salva</button></div></div>
 
-    <div class="card"><h2>Categorie escluse dalle spese</h2>
-      <p class="help">Investimenti e giroconti spostano soldi, non li consumano: non entrano nelle uscite né nei budget.</p>
-      <div class="sugg">${tutteCategorie().filter((c) => !ENTRATE_CAT.includes(c)).map((c) => `<button class="chip ${escl().has(c) ? "best" : ""}" data-act="escludi" data-cat="${esc(c)}">${esc(c)}</button>`).join("")}</div></div>
+    <div class="card"><h2>Categorie</h2>
+      <p class="help">La priorità dice quanto una spesa è evitabile: <span class="in">essenziale</span>, <span class="acc">utile</span>, <span class="out">superflua</span>. Gli insight la usano per dirti dove c'è margine. "Esclusa" vuol dire che non è una spesa (investimenti, giroconti).</p>
+      <div class="grid c2" style="margin-bottom:12px"><input class="field" id="cNuova" placeholder="Nuova categoria, es. Bambini"><button class="btn" data-act="catNuova">Aggiungi categoria</button></div>
+      ${(() => { const n = contaCat(); return tutteCategorie().filter((c) => !ENTRATE_CAT.includes(c)).map((c) => {
+        const ex = escl().has(c), p = prio(c);
+        return `<div style="padding:10px 0;border-top:1px solid var(--soft)"><div class="row"><div style="min-width:0"><div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(c)}</div><div class="sub">${n[c] || 0} movimenti${S.cfg.budget[c] ? ` · budget ${eur0(S.cfg.budget[c])}` : ""}</div></div>
+          ${ex ? `<span class="tag mut" style="border-color:var(--line)">esclusa</span>` : `<div class="sugg" style="margin:0;flex:none">${[1, 2, 3].map((q) => `<button class="chip ${p === q ? "best" : ""}" style="min-height:30px;padding:3px 10px;font-size:12px;${p === q ? `border-color:${PRIO_COL[q]};color:${PRIO_COL[q]}` : ""}" data-act="catPrio" data-cat="${esc(c)}" data-p="${q}">${PRIO_LABEL[q]}</button>`).join("")}</div>`}</div>
+          <div style="display:flex;gap:14px;margin-top:4px"><button class="link" data-act="escludi" data-cat="${esc(c)}">${ex ? "reinserisci nelle spese" : "escludi"}</button><button class="link" data-act="catRinomina" data-cat="${esc(c)}">rinomina</button>${!n[c] ? `<button class="link danger" data-act="catElimina" data-cat="${esc(c)}">elimina</button>` : ""}</div></div>`; }).join(""); })()}</div>
 
     <div class="card"><h2>Regole personali</h2>
       <p class="help">Parola nella descrizione → categoria. Hanno la precedenza sui suggerimenti automatici.</p>
@@ -863,8 +1014,8 @@ async function azione(act, d) {
     case "cat": { const t = trovaTx(d.id); await assegna(t, d.cat); render(); break; }
     case "scadDaTx": {
       const t = trovaTx(d.id);
-      S.scad.items.push({ id: uid(), nome: t.esercente, importo: Math.abs(t.importo), data: addMesi(t.data, 1), cat: categoria(t), ricorrenza: "mensile", pagata: false });
-      await salvaScad(); S.msg = { tipo: "ok", testo: `Scadenza mensile creata per "${t.esercente}" dal ${ddmm(addMesi(t.data, 1))}.` }; S.aperto = null; render(); break;
+      S.scad.items.push({ id: uid(), nome: nome(t), chiave: chiave(t), importo: Math.abs(t.importo), data: addMesi(t.data, 1), cat: categoria(t), ricorrenza: "mensile", pagata: false });
+      await salvaScad(); S.msg = { tipo: "ok", testo: `Scadenza mensile creata per "${nome(t)}" dal ${ddmm(addMesi(t.data, 1))}.` }; S.aperto = null; render(); break;
     }
     case "scadNuova": {
       const nome = $("#sNome").value.trim(), importo = parseNum($("#sImporto").value), data = $("#sData").value;
@@ -883,6 +1034,13 @@ async function azione(act, d) {
     case "obElimina": S.ob.items = S.ob.items.filter((x) => x.id !== d.id); await salvaOb(); render(); break;
     case "stipSalva": S.cfg.stipendio = { importo: parseNum($("#stipImporto").value) || 0, giorno: +$("#stipGiorno").value || 27 }; await salvaCfg(); S.msg = { tipo: "ok", testo: "Stipendio salvato." }; render(); break;
     case "escludi": S.cfg.esclusi = escl().has(d.cat) ? S.cfg.esclusi.filter((c) => c !== d.cat) : [...S.cfg.esclusi, d.cat]; await salvaCfg(); render(); break;
+    case "catNuova": { const n = $("#cNuova").value.trim(); if (!n) return; if (!S.cfg.categorie.includes(n)) S.cfg.categorie.push(n); S.cfg.catInfo[n] = S.cfg.catInfo[n] || { prio: 2 }; await salvaCfg(); S.msg = { tipo: "ok", testo: `Categoria "${n}" creata: la trovi tra le scelte quando categorizzi un movimento.` }; render(); break; }
+    case "catPrio": S.cfg.catInfo[d.cat] = { ...(S.cfg.catInfo[d.cat] || {}), prio: +d.p }; await salvaCfg(); render(); break;
+    case "catRinomina": { const b = prompt(`Nuovo nome per "${d.cat}"`, d.cat); if (!b || !b.trim()) return; const toccati = rinominaCat(d.cat, b.trim()); await Promise.all([...toccati.map(salvaMese), salvaCfg(), salvaScad()]); render(); break; }
+    case "catElimina": { S.cfg.categorie = S.cfg.categorie.filter((c) => c !== d.cat); delete S.cfg.catInfo[d.cat]; delete S.cfg.budget[d.cat]; S.cfg.regole = S.cfg.regole.filter((r) => r.cat !== d.cat); await salvaCfg(); render(); break; }
+    case "ricScad": { const x = ricorrenti().find((y) => y.chiave === d.k); if (!x) return;
+      S.scad.items.push({ id: uid(), nome: x.nome, chiave: x.chiave, importo: +x.importo.toFixed(2), data: x.prossima, cat: x.cat, ricorrenza: x.per, pagata: false });
+      await salvaScad(); S.msg = { tipo: "ok", testo: `Scadenza ${x.per} creata per "${x.nome}" dal ${ddmm(x.prossima)}.` }; render(); break; }
     case "regolaNuova": { const m = $("#rMatch").value.trim(); if (!m) return; S.cfg.regole.push({ match: m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), cat: $("#rCat").value }); await salvaCfg(); render(); break; }
     case "regolaElimina": S.cfg.regole.splice(+d.i, 1); await salvaCfg(); render(); break;
     case "backup": {
